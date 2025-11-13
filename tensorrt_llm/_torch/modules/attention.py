@@ -640,6 +640,20 @@ def mla_custom_op_inplace(
                            latent_cache_gen=latent_cache_gen)
 
 
+# Global flag to track if auto_deploy ops are loaded
+_AUTO_DEPLOY_OPS_LOADED = False
+
+def _ensure_auto_deploy_ops_loaded():
+    """Lazy import auto_deploy custom ops to avoid circular import. Only imports once."""
+    global _AUTO_DEPLOY_OPS_LOADED
+    if not _AUTO_DEPLOY_OPS_LOADED:
+        try:
+            import tensorrt_llm._torch.auto_deploy.custom_ops.quant  # noqa: F401
+            _AUTO_DEPLOY_OPS_LOADED = True
+        except ImportError:
+            pass  # auto_deploy ops not available
+
+
 def fp8_block_scaling_bmm_out(
     mat1: torch.Tensor,
     mat2_fp8: torch.Tensor,
@@ -981,7 +995,11 @@ class MLA(nn.Module):
             self.kv_b_proj.quant_config
             and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())
 
-        mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales else self.dtype
+        has_fp8_per_tensor_scales = (
+            self.kv_b_proj.quant_config
+            and self.kv_b_proj.quant_config.quant_mode.has_fp8_qdq())
+
+        mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales or has_fp8_per_tensor_scales else self.dtype
         self.k_b_proj_trans = nn.Parameter(
             torch.empty(
                 (self.num_heads_tp, self.kv_lora_rank, self.qk_nope_head_dim),
@@ -992,6 +1010,9 @@ class MLA(nn.Module):
 
         self.k_b_proj_trans_dequant = None
         self.v_b_proj_dequant = None
+        self.k_b_proj_trans_input_scale = None
+        self.v_b_proj_input_scale = None
+        
         if has_fp8_block_scales:
             self.k_b_proj_trans_scale = nn.Parameter(
                 torch.empty(
@@ -1035,6 +1056,25 @@ class MLA(nn.Module):
                     ),
                     requires_grad=False,
                 )
+        elif has_fp8_per_tensor_scales:
+            # weight scales
+            self.k_b_proj_trans_scale = nn.Parameter(
+                torch.tensor(1.0, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.v_b_proj_scale = nn.Parameter(
+                torch.tensor(1.0, dtype=torch.float32),
+                requires_grad=False,
+            )
+            # input scales
+            self.k_b_proj_trans_input_scale = nn.Parameter(
+                torch.tensor(1.0, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.v_b_proj_input_scale = nn.Parameter(
+                torch.tensor(1.0, dtype=torch.float32),
+                requires_grad=False,
+            )
         else:
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
@@ -1680,6 +1720,14 @@ class MLA(nn.Module):
             device=q.device,
         )
 
+        kv_b_proj_has_fp8_block_scales = (
+            self.kv_b_proj.quant_config
+            and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales())
+
+        kv_b_proj_has_fp8_per_tensor_scales = (
+            self.kv_b_proj.quant_config
+            and self.kv_b_proj.quant_config.quant_mode.has_fp8_qdq())
+
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.qk_nope_head_dim]
             q_nope_t = q_nope.transpose(0, 1)
@@ -1692,7 +1740,7 @@ class MLA(nn.Module):
             torch.ops.trtllm.bmm_out(q_nope_t,
                                      self.k_b_proj_trans.transpose(1, 2),
                                      q_nope_out)
-        elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
+        elif kv_b_proj_has_fp8_block_scales:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
@@ -1702,6 +1750,22 @@ class MLA(nn.Module):
                 self.k_b_proj_trans_scale,
                 q_nope_out,
                 self.k_b_proj_trans_dequant,
+                )
+        elif kv_b_proj_has_fp8_per_tensor_scales:
+            # [num_heads, num_tokens, self.kv_lora_rank]
+            q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+            
+            # Ensure auto_deploy ops are loaded
+            _ensure_auto_deploy_ops_loaded()
+            
+            # Call FP8 per-tensor BMM and copy result to pre-allocated buffer
+            q_nope_out.copy_(
+                torch.ops.auto_deploy.torch_quant_fp8_bmm(
+                    q_nope.transpose(0, 1),  # [num_heads, num_tokens, qk_nope_head_dim]
+                    self.k_b_proj_trans.transpose(1, 2),  # [num_heads, qk_nope_head_dim, kv_lora_rank]
+                    input_scale=self.k_b_proj_trans_input_scale,
+                    weight_scale=self.k_b_proj_trans_scale,
+                )
             )
         else:
             raise NotImplementedError(
@@ -1750,13 +1814,26 @@ class MLA(nn.Module):
             torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
                                      self.v_b_proj.transpose(1, 2),
                                      attn_output.transpose(0, 1))
-        elif self.v_b_proj.dtype == torch.float8_e4m3fn:
+        elif kv_b_proj_has_fp8_block_scales:
             fp8_block_scaling_bmm_out(
                 attn_out_latent,
                 self.v_b_proj,
                 self.v_b_proj_scale,
                 attn_output.transpose(0, 1),
                 self.v_b_proj_dequant,
+            )
+        elif kv_b_proj_has_fp8_per_tensor_scales:
+            # Ensure auto_deploy ops are loaded
+            _ensure_auto_deploy_ops_loaded()
+            
+            # Call FP8 per-tensor BMM and copy result to pre-allocated buffer
+            attn_output.transpose(0, 1).copy_(
+                torch.ops.auto_deploy.torch_quant_fp8_bmm(
+                    attn_out_latent.transpose(0, 1),  # [num_heads, seq, kv_lora_rank]
+                    self.v_b_proj.transpose(1, 2),  # [num_heads, kv_lora_rank, v_head_dim]
+                    input_scale=self.v_b_proj_input_scale,
+                    weight_scale=self.v_b_proj_scale,
+                )
             )
         else:
             raise NotImplementedError(
